@@ -17,14 +17,20 @@
 //   src* query (an example is in each one) and keep the same output
 //   column names - nothing downstream changes.
 //
-// Loaded to the model : Summary, Settings, Staff, Titles, Office, Pay Periods
+// Loaded to the model : Summary, Staff, Titles, Office, Pay Periods
 // Not loaded          : everything else (right-click > uncheck "Enable load")
 //
 // MODEL RELATIONSHIPS (many-to-one, single direction):
 //   Staff[TitleKey]    -> Titles[TitleKey]
 //   Staff[OfficeKey]   -> Office[OfficeKey]
 //   Staff[Pay Period]  -> Pay Periods[Pay Period]
-//   Summary and Settings stay disconnected (already calculated).
+//   Summary stays disconnected (already calculated).
+//
+// SLICERS (both on Summary, single select):
+//   Baseline : Summary[ReductionSinceLabel]  sort by BaselineOrder
+//   As of    : Summary[ReportDateLabel]      sort by DateOrder
+//   Because both live on Summary, picking a baseline only leaves the
+//   as-of dates on or after it.
 //
 // Sheet columns used (0-based positions in M: A=0, B=1 ... V=21):
 //   Trends Details : B Case_Number, N Inv Created Dt, S Inv Action Type,
@@ -44,7 +50,9 @@
 // PARAMETERS (Home > Manage Parameters > New)
 // ---------------------------------------------------------------------
 // pFilePath           Text     full path to the customer workbook
-// pBaselineDate       Date     1/7/2026      (cell AK5 in Excel)
+// pBaselineDate       Date     1/7/2026      (cell AK5 in Excel) - now the
+//                              FIRST baseline / as-of date in the slicers
+//                              and the one that uses pPercentDenominator
 // pBTPStartDate       Date     5/1/2026      (N/A cut-off used in C7/D7)
 // pFallbackAgents     Decimal  373           (IFERROR fallback in C6/D6)
 // pPercentDenominator Decimal  20371         (hard-coded in E5 =D5/20371)
@@ -298,12 +306,11 @@ in
 // =====================================================================
 
 // ---------------------------------------------------------------------
-// qCohort  (not loaded)
-// The cases behind C5 and D5:
-//   unique case numbers with an "Initial C" action created on or before
-//   the baseline, and no disposition date or a disposition after it.
-// One row per case, with the date the case stops being open.
-// OpenUntilSerial = null means it is still open (blank disposition).
+// qCohortRows  (not loaded)
+// The "Initial C" rows from Trends Details, reduced to the three values
+// the C5 / D5 FILTER uses, read ONCE and kept in memory:
+//   CaseNumber, CreatedSerial (N, numbers only), DispSerial (V; null = open)
+// The baseline filter is applied later, once per baseline date.
 // ---------------------------------------------------------------------
 let
     Src      = fnSheet("Trends Details"),
@@ -315,40 +322,66 @@ let
                    {Cols{18}, "ActionType"},
                    {Cols{21}, "Disposition"}}),
 
-    BaselineSerial = Number.From(pBaselineDate),
-
     // S = "Initial C"  (Excel "=" is not case-sensitive)
     InitialC = Table.SelectRows(Renamed, each
                    (try ([ActionType] is text and Text.Lower([ActionType]) = "initial c") otherwise false)),
 
-    // ISNUMBER(N) * (N <= baseline)
+    // ISNUMBER(N)
     AddCreated = Table.AddColumn(InitialC, "CreatedSerial",
                    each try fnExcelNum([ActionCreated]) otherwise null, type nullable number),
-    CreatedOk  = Table.SelectRows(AddCreated, each
-                   [CreatedSerial] <> null and [CreatedSerial] <= BaselineSerial),
+    CreatedOk  = Table.SelectRows(AddCreated, each [CreatedSerial] <> null),
 
     // V = "" -> open. A text value in V also counts as open, because
     // Excel treats text as greater than any date in V >= date.
     AddDisp  = Table.AddColumn(CreatedOk, "DispSerial",
                    each try fnExcelNum([Disposition]) otherwise null, type nullable number),
 
-    // (V = "") + (V >= baseline + 1)
-    InCohort = Table.SelectRows(AddDisp, each
-                   [DispSerial] = null or [DispSerial] >= BaselineSerial + 1),
-
-    // UNIQUE(case number). A case is open on a date if ANY of its
-    // qualifying rows is still open, so keep the latest disposition
-    // (or null if any row has none).
-    CaseText = Table.TransformColumns(InCohort,
+    CaseText = Table.TransformColumns(AddDisp,
                    {{"CaseNumber", each if _ = null then "" else Text.From(_), type text}}),
-    PerCase  = Table.Group(CaseText, {"CaseNumber"},
-                   {{"OpenUntilSerial",
-                     each if List.Contains([DispSerial], null) then null
-                          else List.Max([DispSerial]),
-                     type nullable number}},
-                   GroupKind.Global, Comparer.OrdinalIgnoreCase)
+    Slim     = Table.Distinct(Table.SelectColumns(CaseText, {"CaseNumber", "CreatedSerial", "DispSerial"}))
 in
-    PerCase
+    Table.Buffer(Slim)
+
+
+// ---------------------------------------------------------------------
+// qAgedGrid  (not loaded)
+// C5 and D5 for EVERY baseline date x EVERY "as of" date (as of >= baseline).
+// For one baseline B:
+//   rows with N <= B, grouped by case (UNIQUE); each case is open until
+//   its latest disposition (null if any row has none);
+//   cohort      = cases still open at B     (V blank or V >= B + 1)
+//   aged at D   = cohort cases open at D     (V blank or V >= D + 1)
+// Baseline options = the same dates as the "as of" list (Jan 7, 2026
+// and every month end). Each baseline is grouped once.
+// ---------------------------------------------------------------------
+let
+    Dates = List.Buffer(qReportDates[ReportDate]),
+
+    AgedFor = (B as date) as table =>
+        let
+            b        = Number.From(B),
+            Rows     = Table.SelectRows(qCohortRows, each [CreatedSerial] <= b),
+            PerCase  = Table.Group(Rows, {"CaseNumber"},
+                           {{"OpenUntil",
+                             each if List.Contains([DispSerial], null) then null else List.Max([DispSerial]),
+                             type nullable number}},
+                           GroupKind.Global, Comparer.OrdinalIgnoreCase),
+            Cohort   = List.Buffer(List.Select(PerCase[OpenUntil], each _ = null or _ >= b + 1)),
+            BaseCnt  = List.Count(Cohort),
+            AsOfs    = List.Select(Dates, each _ >= B),
+            Result   = Table.FromRecords(List.Transform(AsOfs, (d) =>
+                           [ BaselineDate  = B,
+                             ReportDate    = d,
+                             BaselineCount = BaseCnt,
+                             Aged          = List.Count(List.Select(Cohort, each _ = null or _ >= Number.From(d) + 1)) ]))
+        in
+            Result,
+
+    Grid  = Table.Combine(List.Transform(Dates, AgedFor)),
+    Typed = Table.TransformColumnTypes(Grid, {{"BaselineDate", type date}, {"ReportDate", type date},
+                                             {"BaselineCount", Int64.Type}, {"Aged", Int64.Type}})
+in
+    Typed
 
 
 // ---------------------------------------------------------------------
@@ -452,27 +485,42 @@ in
 
 // ---------------------------------------------------------------------
 // Summary  (LOAD)
-// One row per report date x metric - the Excel Summary table for every
-// value in the C4 drop-down.
+// One row per BASELINE date x AS-OF date x metric - the Excel Summary
+// table for every combination, so both dates can be slicers.
 // ---------------------------------------------------------------------
 let
-    Cohort        = List.Buffer(qCohort[OpenUntilSerial]),
-    BaselineCount = List.Count(Cohort),          // every cohort case is open at the baseline (20,343)
     BTPTotal      = qBTPCaseCount,
     BTPDisp       = qBTPDispositions,
 
-    Joined     = Table.NestedJoin(qReportDates, {"ReportDate"}, qAgentsByDate, {"ReportDate"}, "A", JoinKind.LeftOuter),
+    // as-of label / order
+    WithAsOf   = Table.ExpandTableColumn(
+                     Table.NestedJoin(qAgedGrid, {"ReportDate"}, qReportDates, {"ReportDate"}, "R", JoinKind.LeftOuter),
+                     "R", {"DateOrder", "ReportDateLabel"}),
+    // baseline label / order  (the label shows the "since" date, B + 1, like the Excel header)
+    BaseInfo   = Table.RenameColumns(Table.SelectColumns(qReportDates, {"ReportDate", "DateOrder"}),
+                     {{"ReportDate", "BaselineDate"}, {"DateOrder", "BaselineOrder"}}),
+    WithBase   = Table.ExpandTableColumn(
+                     Table.NestedJoin(WithAsOf, {"BaselineDate"}, BaseInfo, {"BaselineDate"}, "B", JoinKind.LeftOuter),
+                     "B", {"BaselineOrder"}),
+    AddSince   = Table.AddColumn(WithBase, "ReductionSinceDate", each Date.AddDays([BaselineDate], 1), type date),
+    AddSinceLb = Table.AddColumn(AddSince, "ReductionSinceLabel", each
+                     Date.ToText([ReductionSinceDate], [Format = "MMMM d, yyyy", Culture = "en-US"]), type text),
+
+    Joined     = Table.NestedJoin(AddSinceLb, {"ReportDate"}, qAgentsByDate, {"ReportDate"}, "A", JoinKind.LeftOuter),
     WithAgents = Table.ExpandTableColumn(Joined, "A", {"BAAgents", "AgentsUsed", "UsedFallback"}),
 
     AddRows = Table.AddColumn(WithAgents, "Rows", (r) =>
         let
             d        = Number.From(r[ReportDate]),
 
-            // C5: cohort cases still open on the report date (V blank or V >= C4 + 1)
-            aged     = List.Count(List.Select(Cohort, each _ = null or _ >= d + 1)),
+            // C5: cohort cases still open on the as-of date
+            aged     = r[Aged],
             // D5: open at baseline minus open now
-            running  = BaselineCount - aged,
+            running  = r[BaselineCount] - aged,
             agents   = r[AgentsUsed],
+            // E5: Excel divides by a hard-coded 20371 for the Jan 7 baseline;
+            // every other baseline uses its own baseline count
+            pctDen   = if r[BaselineDate] = pBaselineDate then pPercentDenominator else r[BaselineCount],
 
             // C7 / D7 / E7
             btpOn    = r[ReportDate] >= pBTPStartDate,
@@ -484,7 +532,7 @@ let
             {
                 [MetricOrder = 1, Metric = "Aged Pending Cases",
                     AsOfValue = aged,          RunningReductionValue = running,
-                    PercentValue = running / pPercentDenominator],              // E5 = D5/20371
+                    PercentValue = if pctDen = 0 then 0 else running / pctDen],
                 [MetricOrder = 2, Metric = "Per Agent Caseload",
                     AsOfValue = aged / agents, RunningReductionValue = running / agents,
                     PercentValue = null],                                         // merged with E5 in Excel
@@ -493,7 +541,9 @@ let
                     PercentValue = btpPct]
             }),
 
-    Slim      = Table.SelectColumns(AddRows, {"ReportDate", "DateOrder", "ReportDateLabel", "BAAgents", "AgentsUsed", "UsedFallback", "Rows"}),
+    Slim      = Table.SelectColumns(AddRows, {"BaselineDate", "BaselineOrder", "ReductionSinceDate", "ReductionSinceLabel",
+                    "BaselineCount", "ReportDate", "DateOrder", "ReportDateLabel",
+                    "BAAgents", "AgentsUsed", "UsedFallback", "Rows"}),
     ExpList   = Table.ExpandListColumn(Slim, "Rows"),
     ExpRec    = Table.ExpandRecordColumn(ExpList, "Rows",
                     {"MetricOrder", "Metric", "AsOfValue", "RunningReductionValue", "PercentValue"}),
@@ -502,7 +552,10 @@ let
                     {"MetricOrder", Int64.Type}, {"Metric", type text},
                     {"AsOfValue", type number}, {"RunningReductionValue", type number},
                     {"PercentValue", type number}, {"BAAgents", type number},
-                    {"AgentsUsed", type number}}),
+                    {"AgentsUsed", type number}, {"BaselineDate", type date},
+                    {"BaselineOrder", Int64.Type}, {"BaselineCount", Int64.Type},
+                    {"ReportDate", type date}, {"DateOrder", Int64.Type},
+                    {"ReportDateLabel", type text}, {"UsedFallback", type logical}}),
 
     // Display columns, formatted like the Excel cells (N/A, 9,316, 54.13%)
     AddAsOf   = Table.AddColumn(Typed, "As of", each
@@ -512,21 +565,9 @@ let
     AddPct    = Table.AddColumn(AddRun, "Total Percent Reduced", each
                     if [PercentValue] = null then "" else Number.ToText([PercentValue], "0.00%", "en-US"), type text),
 
-    Sorted    = Table.Sort(AddPct, {{"DateOrder", Order.Ascending}, {"MetricOrder", Order.Ascending}})
+    Sorted    = Table.Sort(AddPct, {{"BaselineOrder", Order.Ascending}, {"DateOrder", Order.Ascending}, {"MetricOrder", Order.Ascending}})
 in
     Sorted
 
-
-// ---------------------------------------------------------------------
-// Settings  (LOAD) - one row, used for the header text
-// ---------------------------------------------------------------------
-let
-    T = #table(
-        type table [BaselineDate = date, ReductionSinceDate = date,
-                    BaselineCount = Int64.Type, PercentDenominator = number],
-        {{ pBaselineDate,
-           Date.AddDays(pBaselineDate, 1),
-           List.Count(qCohort[OpenUntilSerial]),
-           pPercentDenominator }})
-in
-    T
+// (The old Settings query is no longer needed - the baseline and
+//  "since" dates now live on every Summary row. Delete it.)
